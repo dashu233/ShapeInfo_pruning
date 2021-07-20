@@ -1,0 +1,12 @@
+__pycache__
+data
+*.pth
+*.egg-info
+.idea/deployment.xml
+.idea/misc.xml
+.idea/modules.xml
+.idea/ShapeInfo_pruning.iml
+.idea/vcs.xml
+.idea/webServers.xml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/inspectionProfiles/Project_Default.xml
