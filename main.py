@@ -16,7 +16,7 @@ import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
 from build_loader import build_data_loader
-from model_builder import build_model,need_featmap
+from model_builder import build_model, model_to_gpu
 from utils import is_main_process,accuracy,adjust_learning_rate,ProgressMeter,AverageMeter
 import torchvision.models as models
 from prune_method import prune_model
@@ -85,10 +85,13 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 def add_dcp_parameters():
     parser.add_argument('--dcp_loss_penalty', type=float, default=1e-5)
     parser.add_argument('--dcp_name_list', type=str,
-                        default="['conv1','layer1.0.conv1','layer2.0.conv1','layer3.0.conv1']")
+                        default="[\"conv1\",\"layer1.0.conv1\",\"layer2.0.conv1\",\"layer3.0.conv1\"]")
     parser.add_argument('--dcp_prune_criterion_iter', type=int, default=100)
     parser.add_argument('--dcp_epoch_per_stage',type=int,default=20)
-    parser.add_argument('--dcp_criterion_finetune_epoch)',type=int,default=10)
+    parser.add_argument('--dcp_criterion_finetune_epoch',type=int,default=1)
+def add_st_gRDA_parameters():
+    parser.add_argument('--st_gRDA_mu',type=float,default=0.501)
+    parser.add_argument('--st_gRDA_c',type=float,default=1e-4)
 
 parser.add_argument('--prune',type=bool,default=False,help='whether prune or not')
 parser.add_argument('--prune_steps',type=str,default='[100,150,200,250]',help='prune at step i')
@@ -103,7 +106,7 @@ parser.add_argument('--checkpoint_interval',type=int,default=20,help='epoch inte
 parser.add_argument('--lr_adjust_steps',type=str,default='[30,60,90]',help='lr *= 0.1 step')
 parser.add_argument('--vflip',type=bool,default=False)
 parser.add_argument('--hflip',type=bool,default=True)
-parser.add_argument('--feat_name_list',type=str,default="['conv1','layer1.0.conv1','layer2.0.conv1','layer3.0.conv1']")
+add_dcp_parameters()
 
 best_acc1 = 0
 
@@ -113,7 +116,6 @@ def main():
     args = parser.parse_args()
     args.prune_steps = json.loads(args.prune_steps)
     args.lr_adjust_steps = json.loads(args.lr_adjust_steps)
-    args.feat_name_list = json.loads(args.feat_name_list)
     args.dcp_name_list = json.loads(args.dcp_name_list)
 
     if not os.path.exists('output'):
@@ -197,6 +199,12 @@ def main_worker(gpu, ngpus_per_node, args):
     optimizer = torch.optim.SGD(para_group, args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
+    if args.method == 'DCP':
+        args.all_layer_names = []
+        for name,m in model.named_modules():
+            args.all_layer_names.append(name)
+    
+    model_to_gpu(args,model,aux_model,leanable_keys)
 
     # optionally resume from a checkpoint
     if args.resume:

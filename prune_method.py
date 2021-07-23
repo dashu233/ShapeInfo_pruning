@@ -1,11 +1,25 @@
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
+import torch.nn as nn
 from utils import is_main_process,accuracy,adjust_learning_rate,AverageMeter,ProgressMeter
 from losses import  network_slimming_loss,DCP_loss
 import time
 import random
 import os
+
+def cal_activition_rate(aux_model,times):
+    assert 'activition_map' in aux_model
+    act_map = aux_model['activition_map']
+    for ky in act_map:
+        act_map = act_map[ky]/times
+
+def remove_hooks(aux_model):
+    assert 'handle' in aux_model
+    hds = aux_model['handle']
+    for ky in hds:
+        hds[ky].remove()
+    
 
 def remain_rate(epoch,args):
     if args.method == 'DCP':
@@ -22,7 +36,7 @@ def prune_model(train_loader,train_sampler,val_loader,model,
     ngpus_per_node = torch.cuda.device_count()
     if not args.prune:
         return -1
-    if args.method == 'network_slimming':
+    if args.method == 'network_slimming' or args.method == 'st_gRDA':
         for epoch in range(args.start_epoch, args.epochs):
             if args.distributed:
                 train_sampler.set_epoch(epoch)
@@ -87,7 +101,7 @@ def prune_model(train_loader,train_sampler,val_loader,model,
 
     elif args.method == 'DCP':
         all_layers_name = args.all_layer_names
-        stage_layers_name = args.stage_layers_name
+        stage_layers_name = args.dcp_name_list
         assert 'proto_model' in aux_model
         assert 'dcp_classifier' in aux_model
         assert 'orig_feats' in aux_model
@@ -99,12 +113,13 @@ def prune_model(train_loader,train_sampler,val_loader,model,
                 if args.distributed:
                     train_sampler.set_epoch(epoch)
                 train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model, aux_para)
-            st = 0 if ind == 0 else (all_layers_name.index(stage[ind - 1])+1)
+            st = 0 if ind == 0 else (all_layers_name.index(stage_layers_name[ind - 1])+1)
             end = all_layers_name.index(stage_layers_name[ind])+1
             prune_list = all_layers_name[st:end]
-
+            print('all layer to prune in stage {}:{}'.format(stage,prune_list))
             # compute criterion
             for name,m in model.named_modules():
+                #print(name)
                 if name in prune_list and isinstance(m,nn.Conv2d):
                     out_channels = m.out_channels
                     prune_channel = min(int(args.prune_rate*out_channels),out_channels-1)
@@ -112,17 +127,20 @@ def prune_model(train_loader,train_sampler,val_loader,model,
                     for _ in range(prune_channel):
                         if args.distributed:
                             train_sampler.set_epoch(random.randint(0, 1000))
-                        for it, images, target in enumerate(train_loader):
+                        for it, (images, target) in enumerate(train_loader):
                             if args.gpu is not None:
                                 images = images.cuda(args.gpu, non_blocking=True)
-                            if torch.cuda.is_available():
                                 target = target.cuda(args.gpu, non_blocking=True)
-                            loss, output = DCP_loss(model, images, target, criterion, aux_para['stage'], aux_model,
+                            if torch.cuda.is_available():
+                                images = images.cuda(non_blocking=True)
+                                target = target.cuda(non_blocking=True)
+                            loss, output = DCP_loss(model, images, target, criterion, stage, aux_model,
                                                     args,tp='criterion')
                             loss.backward()
+                            
                             if it > args.dcp_prune_criterion_iter:
                                 break
-                        gd = m.weight.data.grad
+                        gd = m.weight_orig.grad
                         mask = m.weight_mask.detach().clone()
                         crt = torch.norm(gd.view(gd.shape[0],-1),dim=1)
                         remain_channel = torch.where(mask[:,0,0,0]>0)[0]
@@ -132,13 +150,15 @@ def prune_model(train_loader,train_sampler,val_loader,model,
                         prune.custom_from_mask(m, 'weight', mask)
 
                         optimizer.zero_grad()
-                        for ep in range(len(args.dcp_criterion_finetune_epoch)):
-                            for it, images, target in enumerate(train_loader):
+                        for ep in range(args.dcp_criterion_finetune_epoch):
+                            for it, (images, target) in enumerate(train_loader):
                                 if args.gpu is not None:
                                     images = images.cuda(args.gpu, non_blocking=True)
-                                if torch.cuda.is_available():
                                     target = target.cuda(args.gpu, non_blocking=True)
-                                loss, output = DCP_loss(model, images, target, criterion, aux_para['stage'], aux_model,
+                                if torch.cuda.is_available():
+                                    images = images.cuda(non_blocking=True)
+                                    target = target.cuda(non_blocking=True)
+                                loss, output = DCP_loss(model, images, target, criterion,stage, aux_model,
                                                     args, tp='criterion')
                                 loss.backward()
                                 optimizer.step()
@@ -149,12 +169,12 @@ def prune_model(train_loader,train_sampler,val_loader,model,
 def compute_global_step(it,epoch,train_loader_length,args,aux_para):
     if args.method == 'DCP':
         assert 'stage' in aux_para
-        ind = args.stage_layers_name.index(aux_para['stage'])
+        ind = args.dcp_name_list.index(aux_para['stage'])
         if it < 0:
             # iter < 0 means only consider epoch
-            return epoch + args.epoch_per_stage * ind
+            return epoch + args.dcp_epoch_per_stage * ind
         else:
-            return it + (epoch + args.epoch_per_stage * ind) * train_loader_length
+            return it + (epoch + args.dcp_epoch_per_stage * ind) * train_loader_length
     else:
         if it < 0:
             # iter < 0 means only consider epoch
@@ -174,14 +194,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
         [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
+
     # switch to train mode
     model.train()
 
     end = time.time()
-    if args.method == 'DCP':
-        pass
-    else:
-        raise NotImplementedError
 
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
@@ -190,8 +207,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
-        if torch.cuda.is_available():
             target = target.cuda(args.gpu, non_blocking=True)
+        if torch.cuda.is_available():
+            images = images.cuda(non_blocking=True)
+            target = target.cuda(non_blocking=True)
 
         if args.method == 'network_slimming':
             loss,output = network_slimming_loss(model,images,target,criterion,args)
@@ -199,7 +218,29 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
             assert 'stage' in aux_para
             loss,output = DCP_loss(model,images,target,criterion,aux_para['stage'],aux_model,args)
         else:
-            raise NotImplementedError
+            output = model(images)
+            loss = criterion(output,target)
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+
+        if args.method == 'st_gRDA':
+            assert 'bn_history' in aux_model
+            assert 'bn_original' in aux_model
+            for name,m in model.named_modules():
+                if name in aux_model['bn_history']:
+                    aux_model['bn_history'][name] = aux_model['bn_history'][name] + m.weight.grad
+    
+        optimizer.step()
+        if args.method == 'st_gRDA':
+            assert 'bn_history' in aux_model
+            assert 'bn_original' in aux_model
+            for name,m in model.named_modules():
+                if name in aux_model['bn_history']:
+                    step = compute_global_step(i,epoch,len(train_loader),args,aux_para)
+                    m.weight = gRDA_update(aux_model['bn_original'][name],aux_model['bn_history'][name],args,step)
+        
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -208,10 +249,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -226,7 +264,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
                 writer.add_scalar('top5_train_iter', acc5[0], step)
                 writer.add_scalar('loss_train_iter', loss.item(), step)
                 if args.method == 'DCP':
-                    writer.add_scalar('stage_index', args.stage_layers_name.index(aux_para['stage']), step)
+                    writer.add_scalar('stage_index', args.dcp_name_list.index(aux_para['stage']), step)
 
 
 def validate(val_loader, model, criterion, args, epoch, writer=None,aux_para=None):
@@ -343,4 +381,7 @@ def flip_validate(val_loader, model, criterion, args, epoch, writer=None,aux_par
         writer.add_scalar('diff_h_val_ep', Diff_h.avg, step)
     return Acc_orig.avg, Acc_v.avg, Acc_h.avg, Diff_v.avg, Diff_h.avg
 
-
+def gRDA_update(original,history,args,it):
+    thr = args.gRDA_c* (args.lr)**0.5 * (it*args.lr)**args.gRDA_mu
+    tmp = original - history * args.lr
+    return torch.where(tmp > thr, tmp-thr,torch.new_zeros(tmp))

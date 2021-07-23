@@ -6,12 +6,11 @@ import copy
 import torch.nn.utils.prune as prune
 from custom_model import DCPClassifier
 
-def need_featmap(args):
-    return args.method in ['DCP']
 
 def add_prune_mask(model,args):
+    print('add prune mask to model')
     for name, module in model.named_modules():
-        if args.method == 'slimming':
+        if args.method == 'slimming' or 'st_gRDA':
             if isinstance(module, torch.nn.BatchNorm2d):
                 prune.l1_unstructured(module, name='weight', amount=0)
                 prune.l1_unstructured(module, name='bias', amount=0)
@@ -52,11 +51,11 @@ def build_model(args):
                 raise NotImplementedError
 
     if args.method == 'DCP':
-        name_list = args.feat_name_list
+        name_list = args.dcp_name_list
         #name_list = ['conv1','layer1.0.conv1','layer2.0.conv1','layer3.0.conv1']
         def gethook(tarlist,name):
             def hook(model, input, output):
-                tarlist[name] = output.clone()
+                tarlist[name] = output
             return hook
 
         aux_model['proto_model'] = copy.deepcopy(model)
@@ -71,13 +70,44 @@ def build_model(args):
             if name in name_list:
                 hk = gethook(aux_model['orig_feats'],name)
                 m.register_forward_hook(hk)
-
-    if args.method == "DCP":
         if args.dataset == 'Cifar10':
             aux_model['dcp_classifier'] = DCPClassifier(args,model)
             learnable_keys.append('dcp_classifier')
+    if args.method == 'st_gRDA':
+        aux_model['bn_original'] = {}
+        aux_model['bn_history'] = {}
+        for name,m in model.named_modules():
+            if isinstance(m,torch.nn.BatchNorm2d):
+                aux_model['bn_original'][name] = m.weight.detach().clone()
+                aux_model['bn_history'][name] = 0
 
+    if args.method == "big_kernel":
+        # gather activaction map
+        EPS = 1e-8
+        def getacthook(tar_dict,name):
+            def hook(model, input, output):
+                act = torch.where(output<EPS,torch.zeros_like(output),torch.ones_like(output))
+                if name in tar_dict:
+                    tar_dict[name] += act
+                else:
+                    tar_dict[name] = act
+                # may accelerate by remove if 
+
+        aux_model['activition_map'] = {}
+        aux_model['handle'] = {}
+        for name,m in model.named_modules():
+            if isinstance(m,torch.nn.ReLU()):
+                hk = getacthook(aux_model['activition_map'],name)
+                hd = m.register_forward_hook(hk)
+                aux_model['handle'][name] = hd
+
+    return model,aux_model,learnable_keys
+
+def model_to_gpu(args,model,aux_model,learnable_keys):
     ngpus_per_node = torch.cuda.device_count()
+    if args.prune:
+        add_prune_mask(model,args)
+
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
@@ -90,6 +120,8 @@ def build_model(args):
             for ky in aux_model:
                 if isinstance(aux_model[ky],torch.nn.Module):
                     aux_model[ky].cuda(args.gpu)
+                if isinstance(aux_model[ky],torch.Tensor):
+                    aux_model[ky] = aux_model[ky].to(args.gpu)
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
@@ -97,9 +129,7 @@ def build_model(args):
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
 
 
-            if args.prune:
-                add_prune_mask(model,args)
-
+        
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
             for ky in aux_model:
                 if isinstance(aux_model[ky],torch.nn.Module):
@@ -109,6 +139,8 @@ def build_model(args):
             for ky in aux_model:
                 if isinstance(aux_model[ky], torch.nn.Module):
                     aux_model[ky].cuda()
+                if isinstance(aux_model[ky],torch.Tensor):
+                    aux_model[ky] = aux_model[ky].cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
 
@@ -125,6 +157,8 @@ def build_model(args):
         for ky in aux_model:
             if isinstance(aux_model[ky], torch.nn.Module):
                 aux_model[ky].cuda(args.gpu)
+            if isinstance(aux_model[ky],torch.Tensor):
+                    aux_model[ky] = aux_model[ky].to(args.gpu)
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
         if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
@@ -136,5 +170,5 @@ def build_model(args):
         for ky in aux_model:
             if isinstance(aux_model[ky], torch.nn.Module):
                 aux_model[ky] = torch.nn.DataParallel(model).cuda()
-
-    return model,aux_model,learnable_keys
+            if isinstance(aux_model[ky],torch.Tensor):
+                    aux_model[ky] = aux_model[ky].cuda()

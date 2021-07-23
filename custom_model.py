@@ -160,18 +160,22 @@ def _resnet(
         model.load_state_dict(state_dict)
     return model
 
+def formal(st:str):
+    return st.replace('.','_')
 
 class DCPClassifier(nn.Module):
     def __init__(self,args,model:nn.Module,losser='cross_entropy',num_class=10):
         super().__init__()
         channel_list = {}
         name_list = args.dcp_name_list
-        self.discriminal_layer_list = name_list
+        self.discriminal_layer_list = []
         for name,m in model.named_modules():
             if name in name_list:
+                name = formal(name)
                 assert hasattr(m,'out_channels'),'model in name list is not a Linear or Conv2d'
                 channel_list[name] = m.out_channels
-
+                self.discriminal_layer_list.append(name)
+        print('channel_list:',channel_list)
         self.dcp_loss_penalty = args.dcp_loss_penalty
         if losser == 'cross_entropy':
             self.losser = nn.CrossEntropyLoss()
@@ -179,17 +183,21 @@ class DCPClassifier(nn.Module):
         avg_layers = {}
         classifers = {}
         for name in name_list:
+            name = formal(name)
+            print(name)
             bn_layers[name] = nn.BatchNorm2d(channel_list[name])
             avg_layers[name] = nn.AdaptiveAvgPool2d((1,1))
             classifers[name] = nn.Linear(channel_list[name],num_class)
         self.bn_layers = nn.ModuleDict(bn_layers)
         self.avg_layers = nn.ModuleDict(avg_layers)
         self.classifer_dict = nn.ModuleDict(classifers)
-    def forward(self,feats,y,name):
-        assert name in self.discriminal_layer_list
+    def forward(self,feats,y=None,name=None):
+        #print(y,name)
+        name = formal(name)
+        assert name in self.discriminal_layer_list,name
         bi = self.bn_layers[name](feats)
         oi = self.avg_layers[name](bi)
-        oi.view(oi.shape[0], -1)
+        oi = oi.view(oi.shape[0], -1)
         pi = self.classifer_dict[name](oi)
         loss = self.losser(pi, y)
         return loss,pi

@@ -31,7 +31,10 @@ class ProgressMeter(object):
 def adjust_learning_rate(optimizer, epoch, args,writer=None):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     adjust_steps = args.lr_adjust_steps
-
+    if args.method == 'st_gRDA':
+        if writer is not None:
+            writer.add_scalar('lr', args.lr, epoch)
+        return
 
     if epoch in adjust_steps:
         args.lr *= 0.1

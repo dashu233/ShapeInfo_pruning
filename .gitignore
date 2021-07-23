@@ -1,6 +1,8 @@
 __pycache__
 data
+output
 *.pth
+*.pt
 *.egg-info
 .idea/deployment.xml
 .idea/misc.xml
