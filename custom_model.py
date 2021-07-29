@@ -25,6 +25,8 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 '''
 import sys
+from torch._C import dtype
+from torch.functional import Tensor
 import torch.nn as nn
 import torch
 try:
@@ -34,6 +36,8 @@ except ImportError:
 
 from functools import partial
 from typing import Dict, Type, Any, Callable, Union, List, Optional
+
+
 
 
 cifar10_pretrained_weight_urls = {
@@ -90,15 +94,17 @@ class BasicBlock(nn.Module):
         return out
 
 
+
+
+
 class CifarResNet(nn.Module):
 
-    def __init__(self, block, layers, num_classes=10):
+    def __init__(self, block, layers, args,num_classes=10):
         super(CifarResNet, self).__init__()
         self.inplanes = 16
         self.conv1 = conv3x3(3, 16)
         self.bn1 = nn.BatchNorm2d(16)
         self.relu = nn.ReLU(inplace=True)
-
         self.layer1 = self._make_layer(block, 16, layers[0])
         self.layer2 = self._make_layer(block, 32, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 64, layers[2], stride=2)
@@ -203,6 +209,53 @@ class DCPClassifier(nn.Module):
         return loss,pi
 
 
+class SCBClassifier(nn.Module):
+    def __init__(self,args,model:nn.Module,losser='cross_entropy',num_class=10):
+        super().__init__()
+        self.scb_list = []
+        self.scb_channel_list = {}
+        for name,m in model.named_modules():
+            name = formal(name)
+            if isinstance(m,BasicBlock):
+                self.scb_list.append(name)
+                self.scb_channel_list[name] = m.conv2.out_channels
+        
+        self.scb_loss_penalty = args.scb_loss_penalty
+        if losser == 'cross_entropy':
+            self.losser = nn.CrossEntropyLoss()
+        
+        conv_layers = {}
+        bn_layers = {}
+        avg_layers = {}
+        classifers = {}
+        self.relu = nn.ReLU(inplace=True)
+        for name in self.scb_list:
+            name = formal(name)
+            #print(name)
+            conv_layers[name] = nn.Conv2d(self.scb_channel_list[name],self.scb_channel_list[name],
+                        kernel_size=3,padding=1,bias=False)
+            bn_layers[name] = nn.BatchNorm2d(self.scb_channel_list[name])
+            avg_layers[name] = nn.AdaptiveAvgPool2d((1,1))
+            classifers[name] = nn.Linear(self.scb_channel_list[name],num_class)
+        self.bn_layers = nn.ModuleDict(bn_layers)
+        self.conv_layers = nn.ModuleDict(conv_layers)
+        self.avg_layers = nn.ModuleDict(avg_layers)
+        self.classifer_dict = nn.ModuleDict(classifers)
+    def forward(self,feats,y):
+        #print(y,name)
+        loss = 0
+        for name in feats:
+            feat = feats[name]
+            name = formal(name)
+            ci = self.relu(self.conv_layers[name](feat))
+            bi = self.bn_layers[name](ci)
+            oi = self.avg_layers[name](bi)
+            oi = oi.view(oi.shape[0], -1)
+            pi = self.classifer_dict[name](oi)
+            loss += self.losser(pi, y)
+        return loss * self.scb_loss_penalty
+
+
 def cifar10_resnet20(*args, **kwargs) -> CifarResNet: pass
 def cifar10_resnet32(*args, **kwargs) -> CifarResNet: pass
 def cifar10_resnet44(*args, **kwargs) -> CifarResNet: pass
@@ -234,3 +287,39 @@ for dataset in ["cifar10", "cifar100"]:
         )
 
 
+def cl_conv(orig:nn.Conv2d,mpfc,last_mpfc):
+    if last_mpfc is None:
+        tmp = nn.Conv2d(orig.in_channels, mpfc.shape[0], 
+            kernel_size=orig.kernel_size, padding=orig.padding,stride=orig.stride)
+        tmp.weight = orig.weight[mpfc,:,:,:].clone()
+        return tmp
+    else:
+        tmp = nn.Conv2d(last_mpfc.shape[0], mpfc.shape[0], 
+            kernel_size=orig.kernel_size, padding=orig.padding,stride=orig.stride)
+        tmp.weight = orig.weight[mpfc,last_mpfc,:,:].clone()
+        return tmp
+
+
+
+def slim_CifarResNet(md:CifarResNet):
+    # conv1 and bn1
+    mask = md.bn1.weight_mask
+    mpfc = torch.where(mask>0)[0]
+    tmp = nn.Conv2d(3, mpfc.shape[0], kernel_size=3, padding=1)
+    tmp.weight = md.conv1.weight[mpfc,:,:,:]
+    md.conv1 = tmp
+
+    tmp = nn.BatchNorm2d(mpfc.shape[0])
+    tmp.running_mean = md.bn1.running_mean.clone()[mpfc]
+    tmp.running_var = md.bn1.running_var.clone()[mpfc]
+
+        # x = self.conv1(x)
+        # x = self.bn1(x)
+        # x = self.relu(x)
+        # x = self.layer1(x)
+        # x = self.layer2(x)
+        # x = self.layer3(x)
+
+        # x = self.avgpool(x)
+        # x = x.view(x.size(0), -1)
+        # x = self.fc(x)
