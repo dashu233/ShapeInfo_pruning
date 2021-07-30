@@ -83,6 +83,8 @@ def prune_model(train_loader,train_sampler,val_loader,model,
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                         and args.rank % ngpus_per_node == 0):
                 if epoch % args.checkpoint_interval == args.checkpoint_interval - 1:
+                    for ky in model.state_dict():
+                        print(ky)
                     torch.save({
                         'epoch': epoch + 1,
                         'arch': args.arch,
