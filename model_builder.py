@@ -1,3 +1,4 @@
+from typing import List, Tuple
 import custom_model
 
 import torch.utils.data.distributed
@@ -5,7 +6,7 @@ import torchvision.models as models
 import copy
 import torch.nn.utils.prune as prune
 from custom_model import DCPClassifier,BasicBlock
-
+import torch.nn as nn
 
 def add_prune_mask(model,args):
     print('add prune mask to model')
@@ -23,9 +24,10 @@ def add_prune_mask(model,args):
                 prune.l1_unstructured(module, name='bias', amount=0)
 
 
-def build_model(args):
+def build_model(args) -> Tuple[nn.Module,dict,List,List]:
     aux_model = {}
     learnable_keys = []
+    handles = []
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
         if args.arch in models.__dict__:
@@ -33,7 +35,7 @@ def build_model(args):
         else:
             print('find {} in custom_model'.format(args.arch))
             if args.arch in custom_model.__dict__:
-                model = custom_model.__dict__[args.arch](pretrained=True)
+                model = custom_model.__dict__[args.arch](args=args,pretrained=True)
             else:
                 print('undefined arch')
                 raise NotImplementedError
@@ -45,7 +47,7 @@ def build_model(args):
         else:
             print('find {} in custom_model'.format(args.arch))
             if args.arch in custom_model.__dict__:
-                model = custom_model.__dict__[args.arch]()
+                model = custom_model.__dict__[args.arch](args=args)
             else:
                 print('undefined arch')
                 raise NotImplementedError
@@ -63,12 +65,14 @@ def build_model(args):
         for name,m in model.named_modules():
             if name in name_list:
                 hk = gethook(aux_model['now_feats'],name)
+                handles.append(hk)
                 m.register_forward_hook(hk)
 
         aux_model['orig_feats'] = {}
         for name,m in aux_model['proto_model'].named_modules():
             if name in name_list:
                 hk = gethook(aux_model['orig_feats'],name)
+                handles.append(hk)
                 m.register_forward_hook(hk)
         if args.dataset == 'Cifar10':
             aux_model['dcp_classifier'] = DCPClassifier(args,model)
@@ -81,6 +85,24 @@ def build_model(args):
             if isinstance(m,torch.nn.BatchNorm2d):
                 aux_model['bn_original'][name] = m.weight.detach().clone()
                 aux_model['bn_history'][name] = 0
+    if args.method == "SCB":
+        name_list = args.dcp_name_list
+        def gethook(tarlist,name):
+            def hook(model, input, output):
+                tarlist[name] = output
+            return hook
+
+        aux_model['feats'] = {}
+        for name,m in model.named_modules():
+            if isinstance(m,custom_model.BasicBlock):
+                hk = gethook(aux_model['feats'],name)
+                m.register_forward_hook(hk)
+                handles.append(hk)
+
+        aux_model['scb_classifier'] = custom_model.SCBClassifier(args,model)
+        learnable_keys.append('scb_classifier')
+
+            
 
     if args.method == 'self_distill':
         aux_model['in_feats'] = {}
@@ -117,7 +139,7 @@ def build_model(args):
                 hd = m.register_forward_hook(hk)
                 aux_model['handle'][name] = hd
 
-    return model,aux_model,learnable_keys
+    return model,aux_model,learnable_keys,handles
 
 def model_to_gpu(args,model,aux_model,learnable_keys):
     ngpus_per_node = torch.cuda.device_count()
@@ -133,11 +155,9 @@ def model_to_gpu(args,model,aux_model,learnable_keys):
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
-            for ky in aux_model:
-                if isinstance(aux_model[ky],torch.nn.Module):
-                    aux_model[ky].cuda(args.gpu)
-                if isinstance(aux_model[ky],torch.Tensor):
-                    aux_model[ky] = aux_model[ky].to(args.gpu)
+            if args.method == 'st_gRDA':
+                for ky in aux_model['bn_original']:
+                    aux_model['bn_original'][ky].cuda(args.gpu)                
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
@@ -175,6 +195,11 @@ def model_to_gpu(args,model,aux_model,learnable_keys):
                 aux_model[ky].cuda(args.gpu)
             if isinstance(aux_model[ky],torch.Tensor):
                     aux_model[ky] = aux_model[ky].to(args.gpu)
+        
+        if args.method == 'st_gRDA':
+            for ky in aux_model['bn_original']:
+                aux_model['bn_original'][ky] = aux_model['bn_original'][ky].cuda(args.gpu)
+                #print(ky)
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
         if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):

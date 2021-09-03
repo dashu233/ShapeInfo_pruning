@@ -3,8 +3,10 @@ import torch.nn as nn
 import torch.nn.utils.prune as prune
 import torch.nn as nn
 from utils import is_main_process,accuracy,adjust_learning_rate,AverageMeter,ProgressMeter
-from losses import  network_slimming_loss,DCP_loss,st_margin_loss
 
+
+from utils import is_main_process,accuracy,adjust_learning_rate,AverageMeter,ProgressMeter,channel_remaining
+from losses import  network_slimming_loss,DCP_loss,SCB_loss
 import time
 import random
 import os
@@ -43,6 +45,9 @@ def prune_model(train_loader,train_sampler,val_loader,model,
     remain_percent = 1
     ngpus_per_node = torch.cuda.device_count()
     if not args.prune:
+        return -1
+
+    if args.method == 'SCB':
         for epoch in range(args.start_epoch, args.epochs):
             #args.margin_tmp_penalty = min(epoch,args.margin_warm_epoch)/args.margin_warm_epocg * args.margin_penalty
             if args.distributed:
@@ -97,8 +102,71 @@ def prune_model(train_loader,train_sampler,val_loader,model,
                 for name,m in model.named_modules():
                     if isinstance(m, nn.Conv2d):
                         size = m.weight.data.shape[0]
+                        bn[index:(index + size)] = m.weight.data.abs().clone()
+                        index += size
+
+                y, i = torch.sort(bn, descending=True)
+                thre_index = int(total * remain_percent)
+                thre = y[thre_index]
+
+                pruned = 0
+                for k, m in enumerate(model.modules()):
+                    if isinstance(m, nn.BatchNorm2d):
+                        weight_copy = m.weight.data.clone()
+                        mask = weight_copy.abs().gt(thre).float().cuda()
+                        pruned = pruned + mask.shape[0] - torch.sum(mask)
+                        prune.custom_from_mask(m, 'weight', mask)
+                        prune.custom_from_mask(m, 'bias', mask)
                         
-                        bn[index:(index + size)] = torch.norm(m.weight.data.view(size,-1),dim=1).clone()
+                if is_main_process(args):
+                    channel_remaining(model)
+            # remember best acc@1 and save checkpoint
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
+            if writer is not None:
+                writer.add_scalar('remain_percent', remain_percent, epoch)
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                        and args.rank % ngpus_per_node == 0):
+                if epoch % args.checkpoint_interval == args.checkpoint_interval - 1:
+                    for ky in model.state_dict():
+                        print(ky)
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'best_acc1': best_acc1,
+                        'optimizer': optimizer.state_dict(),
+                    }, os.path.join('output', args.expname, 'ep{:0>3}.pth.tar'.format(epoch)))
+                if is_best:
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'best_acc1': best_acc1,
+                        'optimizer': optimizer.state_dict(),
+                    }, os.path.join('output', args.expname, 'best_model.pth.tar'))
+
+    if args.method == 'network_slimming' or args.method == 'st_gRDA' :
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            adjust_learning_rate(optimizer, epoch, args, writer)
+            train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model)
+            acc1 = validate(val_loader, model, criterion, args, epoch, writer, aux_model)
+            _ = flip_validate(val_loader, model, criterion, args, epoch, writer)
+
+            if epoch in args.prune_steps:
+                remain_percent = remain_rate(epoch, args)
+                total = 0
+                for m in model.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        total += m.weight.data.shape[0]
+                bn = torch.zeros(total)
+                index = 0
+                for m in model.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        size = m.weight.data.shape[0]
+                        bn[index:(index + size)] = m.weight.data.abs().clone()
                         index += size
 
                 y, i = torch.sort(bn, descending=True)
@@ -346,7 +414,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
-        if torch.cuda.is_available():
+        elif torch.cuda.is_available():
             images = images.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
 
@@ -364,13 +432,16 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
                 #print('out_feats',type(aux_model['out_feats'][name]))
                 loss_p += torch.norm((aux_model['in_feats'][name]-aux_model['out_feats'][name]).view(output.shape[0],-1),dim=1).mean()
             loss += loss_p * args.distill_penalty
+        elif args.method == 'SCB':
+            loss,output = SCB_loss(model,images,target,criterion,aux_model,args)
         else:
             output = model(images)
             loss = criterion(output,target)
-
-        # compute gradient and do SGD step
+            # compute gradient and do SGD step
+            # print(loss)
         optimizer.zero_grad()
         loss.backward()
+        optimizer.step()
         if args.method == 'st_gRDA':
             assert 'bn_history' in aux_model
             assert 'bn_original' in aux_model
@@ -417,7 +488,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
             for name,m in model.named_modules():
                 if name in aux_model['bn_history']:
                     step = compute_global_step(i,epoch,len(train_loader),args,aux_para)
-                    m.weight = gRDA_update(aux_model['bn_original'][name],aux_model['bn_history'][name],args,step)
+                    m.weight_orig.data = gRDA_update(aux_model['bn_original'][name],aux_model['bn_history'][name],args,step)
         
 
         # measure accuracy and record loss
@@ -561,6 +632,7 @@ def flip_validate(val_loader, model, criterion, args, epoch, writer=None,aux_par
     return Acc_orig.avg, Acc_v.avg, Acc_h.avg, Diff_v.avg, Diff_h.avg
 
 def gRDA_update(original,history,args,it):
-    thr = args.gRDA_c* (args.lr)**0.5 * (it*args.lr)**args.gRDA_mu
+    # print(original.device,history.device)
+    thr = args.st_gRDA_c* (args.lr)**0.5 * (it*args.lr)**args.st_gRDA_mu
     tmp = original - history * args.lr
-    return torch.where(tmp > thr, tmp-thr,torch.new_zeros(tmp))
+    return torch.where(tmp > thr, tmp-thr,torch.zeros_like(tmp))

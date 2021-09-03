@@ -42,6 +42,22 @@ def network_slimming_loss(model,images,targets,criterion,args):
             loss = loss + m.weight.data.abs().sum() * args.slimming_penalty
     return loss,output
 
+def SCB_loss(model,images,target,criterion,aux_model,args):
+    assert 'scb_classifier' in aux_model
+    assert 'feats' in aux_model
+    output = model(images)
+    
+    loss = criterion(output,target)
+
+    classifier = aux_model['scb_classifier']
+    loss += classifier(aux_model['feats'],target)
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            loss = loss + m.weight.data.abs().sum() * args.scb_slimming_penalty
+    return loss, output
+
+
+
 def DCP_loss(model,images,targets,criterion,stage_name,aux_model,args,tp='finetune_stage'):
     #print(type(aux_model['dcp_classifier']))
     if tp == 'finetune_stage':

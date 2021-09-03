@@ -1,12 +1,26 @@
 import torch
 import torch.distributed as dist
+import math
+import torch.nn as nn
 def is_main_process(args):
     if torch.distributed.is_initialized():
         return dist.get_rank() % args.world_size == 0
     else:
         return True
 
-
+def channel_remaining(model,mask_way='bn'):
+    if mask_way=='bn':
+        last_name = ''
+        kernel_size = 3
+        for name,n in model.named_modules():
+            # print(type(n))
+            if isinstance(n, nn.Conv2d):
+                last_name = name
+                kernel_size = n.kernel_size
+            if isinstance(n, nn.BatchNorm2d):
+                print('conv_name:{},remain channels:{},kernel_size:{}'.format(
+                    last_name,int(torch.sum(n.weight_mask).item()),kernel_size))
+    return
 
 class ProgressMeter(object):
     def __init__(self, num_batches, meters, prefix=""):

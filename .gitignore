@@ -1,6 +1,7 @@
 __pycache__
 data
 output
+debug.py
 *.pth
 *.pt
 *.egg-info

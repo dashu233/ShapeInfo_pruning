@@ -17,7 +17,7 @@ import torch.utils.data
 import torch.utils.data.distributed
 from build_loader import build_data_loader
 from model_builder import build_model, model_to_gpu
-from utils import is_main_process,accuracy,adjust_learning_rate,ProgressMeter,AverageMeter
+from utils import is_main_process,accuracy,adjust_learning_rate,ProgressMeter,AverageMeter,channel_remaining
 import torchvision.models as models
 from prune_method import prune_model
 import torch.nn.utils.prune as prune
@@ -95,8 +95,10 @@ def add_dcp_parameters():
 def add_st_gRDA_parameters():
     parser.add_argument('--st_gRDA_mu',type=float,default=0.501)
     parser.add_argument('--st_gRDA_c',type=float,default=1e-4)
-def add_distill_parameters():
-    parser.add_argument('--distill_penalty',type=float,default=0.001)
+def add_scb_parameters():
+    parser.add_argument('--scb_slimming_penalty',type=float,default=1e-4)
+    parser.add_argument('--scb_loss_penalty',type=float,default=0.1)
+
 
 parser.add_argument('--prune',type=str2bool,default='False',help='whether prune or not')
 parser.add_argument('--prune_steps',type=str,default='[100,150,200,250]',help='prune at step i')
@@ -116,8 +118,8 @@ def add_margin_argument():
     parser.add_argument('--margin_warm_epoch',type=int,default=5)
     parser.add_argument('--margin_tmp_penalty',type=float,default=0.0001)
 add_dcp_parameters()
-add_distill_parameters()
 add_margin_argument()
+
 best_acc1 = 0
 parser.add_argument('--scaling_norm_criterion',type=str2bool,default='False')
 parser.add_argument('--use_global_criterion',type=str2bool,default='False')
@@ -125,9 +127,8 @@ parser.add_argument('--view_checkpoint',type=str,default='')
 parser.add_argument('--prune_last',type=str2bool,default='False')
 parser.add_argument('--margin_overthr',type=float,default=1.01)
 
-
+args = parser.parse_args()
 def main():
-    args = parser.parse_args()
     args.prune_steps = json.loads(args.prune_steps)
     args.lr_adjust_steps = json.loads(args.lr_adjust_steps)
     args.dcp_name_list = json.loads(args.dcp_name_list)
@@ -167,6 +168,25 @@ def main():
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
+    if args.view:
+        model,aux_model,learnable_keys = build_model(args)
+        model_to_gpu(args,model,aux_model,learnable_keys)
+
+        args.resume = 'output/cifar10_st_gRDA_pretrained/ep099.pth.tar'
+
+        if args.gpu is None:
+            checkpoint = torch.load(args.resume)
+        else:
+                # Map model to be loaded to specified single gpu.
+            loc = 'cuda:{}'.format(args.gpu)
+            checkpoint = torch.load(args.resume, map_location=loc)
+
+        model.load_state_dict(checkpoint['state_dict'])
+
+        channel_remaining(model)
+        return
+
+
     ngpus_per_node = torch.cuda.device_count()
     if args.multiprocessing_distributed:
         # Since we have ngpus_per_node processes per node, the total world_size
@@ -205,7 +225,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     print('rank:{}',args.rank)
     # create model
-    model,aux_model,leanable_keys = build_model(args)
+    model,aux_model,leanable_keys,handles = build_model(args)
     # aux_model is a dict contain different part for different method
     print('model build')
     # define loss function (criterion) and optimizer
