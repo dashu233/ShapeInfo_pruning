@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.utils.prune as prune
 import torch.nn as nn
 from utils import is_main_process,accuracy,adjust_learning_rate,AverageMeter,ProgressMeter
-from losses import  network_slimming_loss,DCP_loss
+from losses import  network_slimming_loss,DCP_loss,st_margin_loss
+
 import time
 import random
 import os
@@ -29,15 +30,53 @@ def remain_rate(epoch,args):
         ids = args.prune_steps.index(epoch)
         return (1-args.prune_rate)**((ids+1)/len(args.prune_steps))
 
+def next_remain_rate(epoch,args):
+    for ep in args.prune_steps:
+        if ep > epoch:
+            break
+    ids = args.prune_steps.index(ep)
+    return (1-args.prune_rate)**((ids+1)/len(args.prune_steps))
+
 def prune_model(train_loader,train_sampler,val_loader,model,
         criterion,optimizer,args,writer,aux_model):
     best_acc1 = 0
     remain_percent = 1
     ngpus_per_node = torch.cuda.device_count()
     if not args.prune:
-        return -1
-    if args.method == 'network_slimming' or args.method == 'st_gRDA':
         for epoch in range(args.start_epoch, args.epochs):
+            #args.margin_tmp_penalty = min(epoch,args.margin_warm_epoch)/args.margin_warm_epocg * args.margin_penalty
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            adjust_learning_rate(optimizer, epoch, args, writer)
+            train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model)
+            acc1 = validate(val_loader, model, criterion, args, epoch, writer, aux_model)
+            _ = flip_validate(val_loader, model, criterion, args, epoch, writer)
+            # remember best acc@1 and save checkpoint
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
+            if writer is not None:
+                writer.add_scalar('remain_percent', remain_percent, epoch)
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                        and args.rank % ngpus_per_node == 0):
+                if epoch % args.checkpoint_interval == args.checkpoint_interval - 1:
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'best_acc1': best_acc1,
+                        'optimizer': optimizer.state_dict(),
+                    }, os.path.join('output', args.expname, 'ep{:0>3}.pth.tar'.format(epoch)))
+                if is_best:
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'best_acc1': best_acc1,
+                        'optimizer': optimizer.state_dict(),
+                    }, os.path.join('output', args.expname, 'best_model.pth.tar'))
+    if args.method == 'self_distill':
+        for epoch in range(args.start_epoch, args.epochs):
+            
             if args.distributed:
                 train_sampler.set_epoch(epoch)
             adjust_learning_rate(optimizer, epoch, args, writer)
@@ -47,17 +86,20 @@ def prune_model(train_loader,train_sampler,val_loader,model,
 
             if epoch in args.prune_steps:
                 remain_percent = remain_rate(epoch, args)
+                
                 total = 0
                 for m in model.modules():
-                    if isinstance(m, nn.BatchNorm2d):
+                    if isinstance(m, nn.Conv2d):
                         total += m.weight.data.shape[0]
+
                 bn = torch.zeros(total)
                 index = 0
-                for m in model.modules():
-                    if isinstance(m, nn.BatchNorm2d):
+                for name,m in model.named_modules():
+                    if isinstance(m, nn.Conv2d):
                         size = m.weight.data.shape[0]
+                        
+                        bn[index:(index + size)] = torch.norm(m.weight.data.view(size,-1),dim=1).clone()
                         index += size
-                        bn[index:(index + size)] = m.weight.data.abs().clone()
 
                 y, i = torch.sort(bn, descending=True)
                 thre_index = int(total * remain_percent)
@@ -65,15 +107,111 @@ def prune_model(train_loader,train_sampler,val_loader,model,
 
                 pruned = 0
                 for k, m in enumerate(model.modules()):
-                    if isinstance(m, nn.BatchNorm2d):
-                        weight_copy = m.weight.data.clone()
+                    if isinstance(m, nn.Conv2d):
+                        size = m.weight.data.shape[0]
+                        weight_copy = torch.norm(m.weight.data.view(size,-1),dim=1).clone()
                         mask = weight_copy.abs().gt(thre).float().cuda()
                         pruned = pruned + mask.shape[0] - torch.sum(mask)
-                        prune.custom_from_mask(m, 'weight', mask)
-                        prune.custom_from_mask(m, 'bias', mask)
+                        full_mask = mask.repeat(m.in_channels,m.kernel_size[0],m.kernel_size[1],1)
+                        full_mask = full_mask.permute(3,0,1,2)
+                        prune.custom_from_mask(m, 'weight', full_mask)
                         if is_main_process(args):
-                            print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.
-                                  format(k, int(m.weight.shape[0]), int(sum(m.weight_mask))))
+                            print('layer index: {:d} \t total channel: {} \t remaining channel: {:d}'.
+                                  format(k, m.weight.shape[0], int(torch.sum(m.weight_mask[:,0,0,0]))))
+            # remember best acc@1 and save checkpoint
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
+            if writer is not None:
+                writer.add_scalar('remain_percent', remain_percent, epoch)
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                        and args.rank % ngpus_per_node == 0):
+                if epoch % args.checkpoint_interval == args.checkpoint_interval - 1:
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'best_acc1': best_acc1,
+                        'optimizer': optimizer.state_dict(),
+                    }, os.path.join('output', args.expname, 'ep{:0>3}.pth.tar'.format(epoch)))
+                if is_best:
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'best_acc1': best_acc1,
+                        'optimizer': optimizer.state_dict(),
+                    }, os.path.join('output', args.expname, 'best_model.pth.tar'))
+
+    if args.method == 'network_slimming' or args.method == 'st_gRDA' or args.method == 'st_margin':
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            args.margin_tmp_penalty = min(epoch+1,args.margin_warm_epoch)/args.margin_warm_epoch * args.margin_penalty
+            args.next_remain_rate = next_remain_rate(epoch,args)
+            print('next rate:',args.next_remain_rate)
+            adjust_learning_rate(optimizer, epoch, args, writer)
+            train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model)
+            acc1 = validate(val_loader, model, criterion, args, epoch, writer, aux_model)
+            _ = flip_validate(val_loader, model, criterion, args, epoch, writer)
+
+            if (not args.prune_last and (epoch in args.prune_steps)) or (args.prune_last and epoch == args.prune_steps[-1]):
+                remain_percent = remain_rate(epoch, args)
+                args.remain_percent = remain_percent
+                if args.use_global_criterion:
+                    print('using global criterion')
+                    total = 0
+                    for m in model.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            total += m.weight.data.shape[0]
+                    bn = torch.zeros(total)
+                    index = 0
+                    for m in model.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            size = m.weight.data.shape[0]
+                            if args.scaling_norm_criterion:
+                                bn[index:(index + size)] = m.weight.data.abs().clone()/torch.sum(m.weight.data.abs())
+                            else:
+                                bn[index:(index + size)] = m.weight.data.abs().clone()
+                            index += size
+
+                    y, i = torch.sort(bn, descending=True)
+                    thre_index = int(total * remain_percent)
+                    thre = y[thre_index]
+
+                    pruned = 0
+                    for k, m in enumerate(model.modules()):
+                        if isinstance(m, nn.BatchNorm2d):
+                            weight_copy = m.weight.data.clone()
+                            if args.scaling_norm_criterion:
+                                mask = (weight_copy.abs()/torch.sum(m.weight.data.abs())).gt(thre).float().cuda()
+                            else:
+                                mask = weight_copy.abs().gt(thre).float().cuda()
+                            pruned = pruned + mask.shape[0] - torch.sum(mask)
+                            prune.custom_from_mask(m, 'weight', mask)
+                            prune.custom_from_mask(m, 'bias', mask)
+                            if is_main_process(args):
+                                print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.
+                                    format(k, int(m.weight.shape[0]), int(sum(m.weight_mask))))
+                else:
+                    print('using local criterion')
+                    pruned = 0
+                    for k, m in enumerate(model.modules()):
+                        if isinstance(m, nn.BatchNorm2d):
+                            if args.scaling_norm_criterion:
+                                weight_copy=m.weight.data.abs().clone()/torch.sum(m.weight.data.abs())
+                            else:
+                                weight_copy = m.weight.data.abs().clone()
+                            mask = torch.zeros_like(weight_copy)
+                            _,indice = torch.topk(weight_copy,int(weight_copy.size(0)*remain_percent),largest=True)
+                            mask[indice] = 1
+                            pruned = pruned + mask.shape[0] - torch.sum(mask)
+                            prune.custom_from_mask(m, 'weight', mask)
+                            prune.custom_from_mask(m, 'bias', mask)
+                            if is_main_process(args):
+                                print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.
+                                    format(k, int(m.weight.shape[0]), int(sum(m.weight_mask))))
+
+                
             # remember best acc@1 and save checkpoint
             is_best = acc1 > best_acc1
             best_acc1 = max(acc1, best_acc1)
@@ -212,11 +350,20 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
             images = images.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
 
-        if args.method == 'network_slimming':
-            loss,output = network_slimming_loss(model,images,target,criterion,args)
-        elif args.method == 'DCP':
+        if args.method == 'DCP':
             assert 'stage' in aux_para
             loss,output = DCP_loss(model,images,target,criterion,aux_para['stage'],aux_model,args)
+        elif args.method == 'self_distill':
+            #print('aux:',aux_para)
+            assert 'in_feats','out_feats' in aux_model
+            output = model(images)
+            loss = criterion(output,target)
+            loss_p = 0
+            for name in aux_model['in_feats']:
+                #print('in_feats',type(aux_model['in_feats'][name]))
+                #print('out_feats',type(aux_model['out_feats'][name]))
+                loss_p += torch.norm((aux_model['in_feats'][name]-aux_model['out_feats'][name]).view(output.shape[0],-1),dim=1).mean()
+            loss += loss_p * args.distill_penalty
         else:
             output = model(images)
             loss = criterion(output,target)
@@ -224,14 +371,45 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None,
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
-
         if args.method == 'st_gRDA':
             assert 'bn_history' in aux_model
             assert 'bn_original' in aux_model
             for name,m in model.named_modules():
                 if name in aux_model['bn_history']:
-                    aux_model['bn_history'][name] = aux_model['bn_history'][name] + m.weight.grad
-    
+                    if m.weight.data.grad is not None:
+                        aux_model['bn_history'][name] = aux_model['bn_history'][name] + m.weight.data.grad
+                    else:
+                        print(name)
+        elif args.method == 'network_slimming':
+            for name,m in model.named_modules():
+                if isinstance(m,nn.BatchNorm2d):
+                    m.weight_orig.grad += torch.where(m.weight_orig>0,1.0,-1.0)*args.slimming_penalty
+        elif args.method == 'st_margin':
+            total = 0
+            for m in model.modules():
+                if isinstance(m,nn.BatchNorm2d):
+                    total += m.weight.data.size(0)
+            
+            bn = torch.zeros(total).cuda()
+            index = 0
+
+            for m in model.modules():
+                if isinstance(m,nn.BatchNorm2d):
+                    size = m.weight.data.size(0)
+                    bn[index:index+size] = m.weight.data.abs()
+                    index += size
+            
+            tpk = torch.topk(bn,int(total*(1-args.next_remain_rate)*1.01),largest=False)
+            thr = torch.max(tpk.values)
+            
+            
+            for m in model.modules():
+                if isinstance(m,nn.BatchNorm2d):
+                    tmp = torch.where(m.weight>thr,torch.zeros_like(m.weight),m.weight.detach().clone()).detach().clone()
+                    m.weight_orig.grad += args.margin_tmp_penalty * tmp
+                    #print('grad_sum',torch.sum(m.weight_orig.grad))
+
+
         optimizer.step()
         if args.method == 'st_gRDA':
             assert 'bn_history' in aux_model
@@ -283,9 +461,8 @@ def validate(val_loader, model, criterion, args, epoch, writer=None,aux_para=Non
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
             if torch.cuda.is_available():
+                images = images.cuda(args.gpu, non_blocking=True)
                 target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
@@ -325,6 +502,7 @@ def flip_validate(val_loader, model, criterion, args, epoch, writer=None,aux_par
     Diff_h = AverageMeter('diff_h', ':6.2f')
     Diff_v = AverageMeter('diff_v', ':6.2f')
 
+
     progress = ProgressMeter(
         len(val_loader),
         [batch_time, Acc_orig, Acc_h, Acc_v, Diff_h, Diff_v],
@@ -336,9 +514,9 @@ def flip_validate(val_loader, model, criterion, args, epoch, writer=None,aux_par
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
+                
             if torch.cuda.is_available():
+                images = images.cuda(args.gpu, non_blocking=True)
                 target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
@@ -379,6 +557,7 @@ def flip_validate(val_loader, model, criterion, args, epoch, writer=None,aux_par
         writer.add_scalar('acc_h_val_ep', Acc_h.avg, step)
         writer.add_scalar('diff_v_val_ep', Diff_v.avg, step)
         writer.add_scalar('diff_h_val_ep', Diff_h.avg, step)
+        writer.add_scalar('diff_acc_val_ep', Acc_h.avg-Acc_orig.avg, step)
     return Acc_orig.avg, Acc_v.avg, Acc_h.avg, Diff_v.avg, Diff_h.avg
 
 def gRDA_update(original,history,args,it):

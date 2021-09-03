@@ -4,13 +4,13 @@ import torch.utils.data.distributed
 import torchvision.models as models
 import copy
 import torch.nn.utils.prune as prune
-from custom_model import DCPClassifier
+from custom_model import DCPClassifier,BasicBlock
 
 
 def add_prune_mask(model,args):
     print('add prune mask to model')
     for name, module in model.named_modules():
-        if args.method == 'slimming' or 'st_gRDA':
+        if args.method == 'slimming' or 'st_gRDA' or 'st_margin':
             if isinstance(module, torch.nn.BatchNorm2d):
                 prune.l1_unstructured(module, name='weight', amount=0)
                 prune.l1_unstructured(module, name='bias', amount=0)
@@ -74,12 +74,28 @@ def build_model(args):
             aux_model['dcp_classifier'] = DCPClassifier(args,model)
             learnable_keys.append('dcp_classifier')
     if args.method == 'st_gRDA':
+
         aux_model['bn_original'] = {}
         aux_model['bn_history'] = {}
         for name,m in model.named_modules():
             if isinstance(m,torch.nn.BatchNorm2d):
                 aux_model['bn_original'][name] = m.weight.detach().clone()
                 aux_model['bn_history'][name] = 0
+
+    if args.method == 'self_distill':
+        aux_model['in_feats'] = {}
+        aux_model['out_feats'] = {}
+        def gethook(inlist,outlist,name):
+            def hook(model, input, output):
+                #print('why')
+                inlist[name] = input[0]
+                outlist[name] = output
+            return hook
+        for name,m in model.named_modules():
+            if isinstance(m,BasicBlock):
+                if m.conv1.in_channels == m.conv1.out_channels:
+                    hk = gethook(aux_model['in_feats'],aux_model['out_feats'],name)
+                    m.register_forward_hook(hk)
 
     if args.method == "big_kernel":
         # gather activaction map

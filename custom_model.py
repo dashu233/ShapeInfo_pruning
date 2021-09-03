@@ -88,6 +88,33 @@ class BasicBlock(nn.Module):
         out += identity
         out = self.relu(out)
         return out
+    
+    def compute_BN_mask_FLOPS(self,x):
+        # x shape:1,in_channel,W,H
+        # conv1 & bn1
+        FLOPS = 0
+        identity = x
+        remain_channel = torch.sum(self.bn1.weight_mask)
+        FLOPS += (self.conv1.in_channels*remain_channel*9 + remain_channel)*x.shape[2]*x.shape[3]/self.conv1.stride[0]
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        remain_channel = torch.sum(self.bn2.weight_mask)
+        FLOPS += (self.conv2.in_channels*remain_channel*9 + remain_channel)*out.shape[2]*out.shape[3]/self.conv2.stride[0]
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+            remain_channel = torch.sum(self.downsample[1].weight_mask)
+            FLOPS += (self.downsample[0].in_channels*remain_channel + remain_channel)*x.shape[2]*x.shape[3]/self.downsample[0].stride[0]
+
+        out += identity
+        out = self.relu(out)
+        return out,FLOPS
 
 
 class CifarResNet(nn.Module):
@@ -143,6 +170,27 @@ class CifarResNet(nn.Module):
         x = self.fc(x)
         return x
 
+    def compute_BN_mask_FLOPS(self,x):
+        FLOPS = 0
+        remain_channel = torch.sum(self.bn1.weight_mask)
+        FLOPS += (self.conv1.in_channels*remain_channel*9 + remain_channel)*x.shape[2]*x.shape[3]/self.conv1.stride[0]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        for bk in self.layer1:
+            x,tp = bk.compute_BN_mask_FLOPS(x)
+            FLOPS += tp
+        for bk in self.layer2:
+            x,tp = bk.compute_BN_mask_FLOPS(x)
+            FLOPS += tp
+        for bk in self.layer3:
+            x,tp = bk.compute_BN_mask_FLOPS(x)
+            FLOPS += tp
+        
+        FLOPS += self.fc.in_features*self.fc.out_features
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x,FLOPS
 
 
 def _resnet(

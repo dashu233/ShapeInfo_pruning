@@ -2,7 +2,37 @@ import torch
 import torch.nn as nn
 from custom_model import DCPClassifier
 
+def st_margin_loss(model,images,targets,criterion,args):
+    output = model(images)
+    loss = criterion(output, targets)
 
+    total = 0
+    for m in model.modules():
+        if isinstance(m,nn.BatchNorm2d):
+            total += m.weight.data.size(0)
+    
+    bn = torch.zeros(total).cuda()
+    index = 0
+
+    for m in model.modules():
+        if isinstance(m,nn.BatchNorm2d):
+            size = m.weight.data.size(0)
+            bn[index:index+size] = m.weight.data.abs()
+            index += size
+    
+    tpk = torch.topk(bn,int(total*args.margin_mask_rate),largest=False)
+    indice = tpk.indices
+    loss += args.margin_tmp_penalty * torch.sum(bn[indice].square())
+    
+    # for m in model.modules():
+    #     if isinstance(m,nn.BatchNorm2d):
+    #         mask_rate = (1-args.next_remain_rate)*1.2
+    #         tpk = torch.topk(m.weight.data.abs(),int(m.weight.data.size(0)*mask_rate),largest=False)
+    #         indice = tpk.indices
+    #         #print(indice)
+    #         loss += args.margin_tmp_penalty * torch.sum(torch.square(m.weight.data[indice]))
+            
+    return loss,output
 
 def network_slimming_loss(model,images,targets,criterion,args):
     output = model(images)

@@ -25,7 +25,8 @@ import torch.nn.utils.prune as prune
 import json
 
 from torch.utils.tensorboard import SummaryWriter
-
+def str2bool(t):
+    return True if t.lower() == 'true' else False
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -65,11 +66,11 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
-parser.add_argument('--world-size', default=-1, type=int,
+parser.add_argument('--world-size', default=1, type=int,
                     help='number of nodes for distributed training')
-parser.add_argument('--rank', default=-1, type=int,
+parser.add_argument('--rank', default=0, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', default='tcp://localhost:23456', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -82,6 +83,8 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+
+
 def add_dcp_parameters():
     parser.add_argument('--dcp_loss_penalty', type=float, default=1e-5)
     parser.add_argument('--dcp_name_list', type=str,
@@ -92,11 +95,13 @@ def add_dcp_parameters():
 def add_st_gRDA_parameters():
     parser.add_argument('--st_gRDA_mu',type=float,default=0.501)
     parser.add_argument('--st_gRDA_c',type=float,default=1e-4)
+def add_distill_parameters():
+    parser.add_argument('--distill_penalty',type=float,default=0.001)
 
-parser.add_argument('--prune',type=bool,default=False,help='whether prune or not')
+parser.add_argument('--prune',type=str2bool,default='False',help='whether prune or not')
 parser.add_argument('--prune_steps',type=str,default='[100,150,200,250]',help='prune at step i')
 parser.add_argument('--method',type=str, default='network_slimming',help='criterion for pruning')
-parser.add_argument('--slimming_penalty',type=float,default=1e-3,help='penalty of network slimming term')
+parser.add_argument('--slimming_penalty',type=float,default=1e-4,help='penalty of network slimming term')
 parser.add_argument('--prune_rate',type=float,default=0.5,help='final pruning rate')
 parser.add_argument('--logdir',type=str,default='log',help='log file dir')
 parser.add_argument('--dataset',type=str, default='ImageNet')
@@ -104,12 +109,21 @@ parser.add_argument('--expname',type=str,default='exp1')
 parser.add_argument('--checkpoint_interval',type=int,default=20,help='epoch interval for saving checkpoint')
 
 parser.add_argument('--lr_adjust_steps',type=str,default='[30,60,90]',help='lr *= 0.1 step')
-parser.add_argument('--vflip',type=bool,default=False)
-parser.add_argument('--hflip',type=bool,default=True)
+parser.add_argument('--vflip',type=str2bool,default='False')
+parser.add_argument('--hflip',type=str2bool,default='True')
+def add_margin_argument():
+    parser.add_argument('--margin_penalty',type = float,default = 0.001)
+    parser.add_argument('--margin_warm_epoch',type=int,default=5)
+    parser.add_argument('--margin_tmp_penalty',type=float,default=0.0001)
 add_dcp_parameters()
-
+add_distill_parameters()
+add_margin_argument()
 best_acc1 = 0
-
+parser.add_argument('--scaling_norm_criterion',type=str2bool,default='False')
+parser.add_argument('--use_global_criterion',type=str2bool,default='False')
+parser.add_argument('--view_checkpoint',type=str,default='')
+parser.add_argument('--prune_last',type=str2bool,default='False')
+parser.add_argument('--margin_overthr',type=float,default=1.01)
 
 
 def main():
@@ -117,6 +131,7 @@ def main():
     args.prune_steps = json.loads(args.prune_steps)
     args.lr_adjust_steps = json.loads(args.lr_adjust_steps)
     args.dcp_name_list = json.loads(args.dcp_name_list)
+    args.margin_mask_rate = args.prune_rate*1.05
 
     if not os.path.exists('output'):
         os.mkdir('output')
@@ -184,12 +199,15 @@ def main_worker(gpu, ngpus_per_node, args):
             # For multiprocessing distributed training, rank needs to be the
             # global rank among all the processes
             args.rank = args.rank * ngpus_per_node + gpu
+        print('backend:{},init_method:{},world_size:{},rank:{}'.format(args.dist_backend,args.dist_url,
+            args.world_size,args.rank))
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
+    print('rank:{}',args.rank)
     # create model
     model,aux_model,leanable_keys = build_model(args)
     # aux_model is a dict contain different part for different method
-
+    print('model build')
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
@@ -232,8 +250,63 @@ def main_worker(gpu, ngpus_per_node, args):
 
     val_loader,train_loader,train_sampler = build_data_loader(args)
 
+    
+
+    with torch.no_grad():
+        model.eval()
+        for data,target in val_loader:
+            data = data.cuda()
+            _,FLOPS0 = model.compute_BN_mask_FLOPS(data)
+            print('original FLOPS:',FLOPS0)
+            break
+    
+    if args.view_checkpoint:
+        model.load_state_dict(torch.load(args.view_checkpoint)['state_dict'])
+        with torch.no_grad():
+            model = model.cpu()
+            model.eval()
+            total = 0
+            for m in model.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    total += m.weight.data.shape[0]
+            bn = torch.zeros(total)
+            index = 0
+            for m in model.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    size = m.weight.data.shape[0]
+                    bn[index:(index + size)] = m.weight.data.abs().clone()
+                    index += size
+            
+            import numpy as np
+            np_bn = bn.numpy()
+            import matplotlib.pyplot as plt
+            max_w = np.max(np_bn)
+            np_bn = np_bn/max_w
+
+            fig = plt.figure()
+            plt.ylim(0,10000)
+            plt.hist(np_bn,100,range=[0,0.1])
+            plt.savefig('distribution')
+            
+
+
+            # for data,target in val_loader:
+            #     data = data.cuda()
+            #     _,FLOPS = model.compute_BN_mask_FLOPS(data)
+            #     print('checkpoint FLOPS:{}({}%)'.format(FLOPS,FLOPS/FLOPS0*100))
+            #     return
+
+    model.train()
     prune_model(train_loader,train_sampler,val_loader,model,
         criterion,optimizer,args,writer,aux_model)
+
+    with torch.no_grad():
+        model.eval()
+        for data,target in val_loader:
+            data = data.cuda()
+            _,FLOPS = model.compute_BN_mask_FLOPS(data)
+            print('Final FLOPS:{}({}%)'.format(FLOPS,FLOPS/FLOPS0*100))
+            break
 
     torch.save(model,'final.pth')
 

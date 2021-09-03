@@ -4,6 +4,7 @@ output
 *.pth
 *.pt
 *.egg-info
+*.sh
 .idea/deployment.xml
 .idea/misc.xml
 .idea/modules.xml
