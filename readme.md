@@ -1,6 +1,6 @@
 Structual Margin Pruning
 
-WARN: this method is relay on BN layer, if the model use LN or other normalization layer, this method may not work
+WARN: this method is rely on BN layer, if the model use LN or other normalization layer, this method may not work
 
 To Run Experiment, use the following code
 
