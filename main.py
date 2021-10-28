@@ -272,13 +272,13 @@ def main_worker(gpu, ngpus_per_node, args):
 
     
 
-    with torch.no_grad():
-        model.eval()
-        for data,target in val_loader:
-            data = data.cuda()
-            _,FLOPS0 = model.compute_BN_mask_FLOPS(data)
-            print('original FLOPS:',FLOPS0)
-            break
+    # with torch.no_grad():
+    #     model.eval()
+    #     for data,target in val_loader:
+    #         data = data.cuda()
+    #         _,FLOPS0 = model.compute_BN_mask_FLOPS(data)
+    #         print('original FLOPS:',FLOPS0)
+    #         break
     
     if args.view_checkpoint:
         model.load_state_dict(torch.load(args.view_checkpoint)['state_dict'])
@@ -320,13 +320,13 @@ def main_worker(gpu, ngpus_per_node, args):
     prune_model(train_loader,train_sampler,val_loader,model,
         criterion,optimizer,args,writer,aux_model)
 
-    with torch.no_grad():
-        model.eval()
-        for data,target in val_loader:
-            data = data.cuda()
-            _,FLOPS = model.compute_BN_mask_FLOPS(data)
-            print('Final FLOPS:{}({}%)'.format(FLOPS,FLOPS/FLOPS0*100))
-            break
+    # with torch.no_grad():
+    #     model.eval()
+    #     for data,target in val_loader:
+    #         data = data.cuda()
+    #         _,FLOPS = model.compute_BN_mask_FLOPS(data)
+    #         print('Final FLOPS:{}({}%)'.format(FLOPS,FLOPS/FLOPS0*100))
+    #         break
 
     torch.save(model,'final.pth')
 
