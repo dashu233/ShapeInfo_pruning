@@ -1,5 +1,7 @@
 Structual Margin Pruning
 
+WARN: this method is relay on BN layer, if the model use LN or other normalization layer, this method may not work
+
 To Run Experiment, use the following code
 
 
@@ -25,6 +27,10 @@ training result will be saved in 'output/YOU_EXPERIMENT_NAME'
 `--lr_adjust_steps ` lr decay epoch, decay rate = 0.1
 `--margin_penalty ` the loss weight
 `--wd ` weight decay
+
+the other args are some experimental args, please do not change them
+
+
 
 
 
