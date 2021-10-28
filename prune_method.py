@@ -55,7 +55,7 @@ def prune_model(train_loader,train_sampler,val_loader,model,
             adjust_learning_rate(optimizer, epoch, args, writer)
             train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model)
             acc1 = validate(val_loader, model, criterion, args, epoch, writer, aux_model)
-            _ = flip_validate(val_loader, model, criterion, args, epoch, writer)
+            #_ = flip_validate(val_loader, model, criterion, args, epoch, writer)
             # remember best acc@1 and save checkpoint
             is_best = acc1 > best_acc1
             best_acc1 = max(acc1, best_acc1)
@@ -87,7 +87,7 @@ def prune_model(train_loader,train_sampler,val_loader,model,
             adjust_learning_rate(optimizer, epoch, args, writer)
             train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model)
             acc1 = validate(val_loader, model, criterion, args, epoch, writer, aux_model)
-            _ = flip_validate(val_loader, model, criterion, args, epoch, writer)
+            #_ = flip_validate(val_loader, model, criterion, args, epoch, writer)
 
             if epoch in args.prune_steps:
                 remain_percent = remain_rate(epoch, args)
@@ -153,7 +153,7 @@ def prune_model(train_loader,train_sampler,val_loader,model,
             adjust_learning_rate(optimizer, epoch, args, writer)
             train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model)
             acc1 = validate(val_loader, model, criterion, args, epoch, writer, aux_model)
-            _ = flip_validate(val_loader, model, criterion, args, epoch, writer)
+            #_ = flip_validate(val_loader, model, criterion, args, epoch, writer)
 
             if epoch in args.prune_steps:
                 remain_percent = remain_rate(epoch, args)
@@ -220,7 +220,7 @@ def prune_model(train_loader,train_sampler,val_loader,model,
             adjust_learning_rate(optimizer, epoch, args, writer)
             train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model)
             acc1 = validate(val_loader, model, criterion, args, epoch, writer, aux_model)
-            _ = flip_validate(val_loader, model, criterion, args, epoch, writer)
+            #_ = flip_validate(val_loader, model, criterion, args, epoch, writer)
 
             if (not args.prune_last and (epoch in args.prune_steps)) or (args.prune_last and epoch == args.prune_steps[-1]):
                 remain_percent = remain_rate(epoch, args)

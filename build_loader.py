@@ -5,6 +5,10 @@ import torchvision.datasets as datasets
 import torch
 
 def build_data_loader(args):
+    # This function is used for create dataset for training
+    # val_loader is the test loader, train_loader is the training loader
+    # train_sampler is used for distribute training, set to None if args.distribute is False
+    
     if args.dataset == 'ImageNet':
         traindir = os.path.join(args.data, 'train')
         valdir = os.path.join(args.data, 'val')

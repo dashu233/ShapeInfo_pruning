@@ -168,23 +168,23 @@ def main():
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
-    if args.view:
-        model,aux_model,learnable_keys = build_model(args)
-        model_to_gpu(args,model,aux_model,learnable_keys)
+    # if args.view:
+    #     model,aux_model,learnable_keys = build_model(args)
+    #     model_to_gpu(args,model,aux_model,learnable_keys)
 
-        args.resume = 'output/cifar10_st_gRDA_pretrained/ep099.pth.tar'
+    #     args.resume = 'output/cifar10_st_gRDA_pretrained/ep099.pth.tar'
 
-        if args.gpu is None:
-            checkpoint = torch.load(args.resume)
-        else:
-                # Map model to be loaded to specified single gpu.
-            loc = 'cuda:{}'.format(args.gpu)
-            checkpoint = torch.load(args.resume, map_location=loc)
+    #     if args.gpu is None:
+    #         checkpoint = torch.load(args.resume)
+    #     else:
+    #             # Map model to be loaded to specified single gpu.
+    #         loc = 'cuda:{}'.format(args.gpu)
+    #         checkpoint = torch.load(args.resume, map_location=loc)
 
-        model.load_state_dict(checkpoint['state_dict'])
+    #     model.load_state_dict(checkpoint['state_dict'])
 
-        channel_remaining(model)
-        return
+    #     channel_remaining(model)
+    #     return
 
 
     ngpus_per_node = torch.cuda.device_count()

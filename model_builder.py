@@ -24,7 +24,16 @@ def add_prune_mask(model,args):
                 prune.l1_unstructured(module, name='bias', amount=0)
 
 
+
+
 def build_model(args) -> Tuple[nn.Module,dict,List,List]:
+
+    # this function is used for build model
+    # model is get from torchvision.models or custom_model according to args.arch
+    # if your want to use your custom model, add it into custom_model.py and change args.arch to this model's name
+
+    # the other returned values are created by different pruning alg, don't change them
+
     aux_model = {}
     learnable_keys = []
     handles = []
