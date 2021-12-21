@@ -1,4 +1,4 @@
-#Structual Margin Pruning
+# Structual Margin Pruning
 
 WARN: this method is rely on BN layer, if the model use LN or other normalization layer, this method may not work
 
@@ -21,11 +21,17 @@ training result will be saved in 'output/YOU_EXPERIMENT_NAME'
 
 # hyperparameter
 `--epoch ` total training epoch
+
 `--prune_steps ` prune epoch list for iterative pruning
+
 `--prune_rate ` 1 - final_remain_rate
+
 `--lr ` learning rate
+
 `--lr_adjust_steps ` lr decay epoch, decay rate = 0.1
+
 `--margin_penalty ` the loss weight
+
 `--wd ` weight decay
 
 the other args are some experimental args, please do not change them
