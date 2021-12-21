@@ -368,6 +368,39 @@ def prune_model(train_loader,train_sampler,val_loader,model,
                                                     args, tp='criterion')
                                 loss.backward()
                                 optimizer.step()
+    
+    if args.prune_method == 'no_prune':
+         for epoch in range(args.start_epoch, args.epochs):
+            
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            adjust_learning_rate(optimizer, epoch, args, writer)
+            train(train_loader, model, criterion, optimizer, epoch, args, writer, aux_model)
+            acc1 = validate(val_loader, model, criterion, args, epoch, writer, aux_model)
+            #_ = flip_validate(val_loader, model, criterion, args, epoch, writer)
+            # remember best acc@1 and save checkpoint
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                        and args.rank % ngpus_per_node == 0):
+                if epoch % args.checkpoint_interval == args.checkpoint_interval - 1:
+                    for ky in model.state_dict():
+                        print(ky)
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'best_acc1': best_acc1,
+                        'optimizer': optimizer.state_dict(),
+                    }, os.path.join('output', args.expname, 'ep{:0>3}.pth.tar'.format(epoch)))
+                if is_best:
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'best_acc1': best_acc1,
+                        'optimizer': optimizer.state_dict(),
+                    }, os.path.join('output', args.expname, 'best_model.pth.tar'))
 
 
 
